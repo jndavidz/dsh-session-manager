@@ -18,6 +18,8 @@ export const OPEN_FOLDER_ROUTE = '/dsh-session-manager/open-folder'
 export const PAUSE_ROUTE = '/dsh-session-manager/pause'
 /** Write the context compaction threshold into the official compaction plugin config. */
 export const COMPACTION_THRESHOLD_ROUTE = '/dsh-session-manager/compaction-threshold'
+/** Move one session to a different workspace directory (re-groups it in the UI). */
+export const MOVE_ROUTE = '/dsh-session-manager/move'
 
 /** POST /dsh-session-manager/delete request body. */
 export interface DeleteSessionRequest {
@@ -53,4 +55,22 @@ export interface TrashListResponse {
   entries: TrashEntry[]
   /** Maximum entries kept; the oldest overflow is purged automatically. */
   limit: number
+}
+
+/** POST /dsh-session-manager/move request body. */
+export interface MoveSessionRequest {
+  sessionId: string
+  /** Target directory (canonical on the host); the session re-groups under the matching workspace. */
+  targetCwd: string
+}
+
+/** POST /dsh-session-manager/move response body. */
+export interface MoveSessionResponse {
+  ok: boolean
+  /** Machine-readable failure reason. */
+  error?: string
+  /** The re-created session id (the move rebuilds the log under a fresh id). */
+  newSessionId?: string
+  fromCwd?: string
+  toCwd?: string
 }

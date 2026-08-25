@@ -21,7 +21,18 @@
     "forceConsistentCasingInFileNames": true,
     "types": [
       "node"
-    ]
+    ],
+    "paths": {
+      "@deepseek-ai/dsh-client-ui-slots": [
+        "./types/stubs.d.ts"
+      ],
+      "@deepseek-ai/dsh-client-ui-sidebar/client": [
+        "./types/stubs.d.ts"
+      ],
+      "@deepseek-ai/dsh-client-ui-primitives": [
+        "./types/stubs.d.ts"
+      ]
+    }
   },
   "include": [
     "src"

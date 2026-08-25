@@ -43,9 +43,11 @@ import { defineDomain } from '@deepseek-ai/dsh-storage-domain'
 import { z } from 'zod'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { existsSync } from 'node:fs'
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { dirname, join } from 'node:path'
+import { decompress as zstdDecompress } from 'fzstd'
 
 export const name = 'dsh-session-manager'
 export const inject = [
@@ -118,6 +120,48 @@ function trashRoot(): string {
 }
 function trashSessionDir(sessionId: string): string {
   return join(trashRoot(), sessionId)
+}
+
+/** One parsed session log: the header object (without its `type` tag) plus the event objects. */
+interface SessionLog {
+  header: Record<string, unknown>
+  events: Record<string, unknown>[]
+}
+
+/**
+ * Read and parse a session artifact (`session.jsonl` or zstd-compressed
+ * `session.jsonl.zstd`). The first line must be the `session` header; every
+ * remaining line must parse — a corrupt log aborts the move instead of being
+ * silently truncated.
+ */
+async function readSessionLog(artifactPath: string): Promise<SessionLog> {
+  const raw = await readFile(artifactPath)
+  let text: string
+  if (artifactPath.endsWith('.zstd')) {
+    text = new TextDecoder().decode(zstdDecompress(new Uint8Array(raw)))
+  } else {
+    text = raw.toString('utf8')
+  }
+  const lines = text.split('\n').filter((line) => line.trim().length > 0)
+  if (lines.length === 0) throw new Error('empty session log')
+  let header: Record<string, unknown>
+  try {
+    header = JSON.parse(lines[0]) as Record<string, unknown>
+  } catch {
+    throw new Error('unparsable session header')
+  }
+  if (header.type !== 'session') throw new Error('first line is not a session header')
+  const events: Record<string, unknown>[] = []
+  for (let index = 1; index < lines.length; index++) {
+    try {
+      events.push(JSON.parse(lines[index]) as Record<string, unknown>)
+    } catch {
+      throw new Error(`unparsable event line ${index + 1}`)
+    }
+  }
+  const { type: _type, ...rest } = header
+  void _type
+  return { header: rest, events }
 }
 
 function readJsonBody(req: IncomingMessage): Promise<unknown> {
@@ -503,6 +547,171 @@ export function apply(ctx: Context): Promise<() => Promise<void>> {
         } catch (error) {
           ctx.logger.warn('[dsh-session-manager] delete failed:', error)
           respond(res, 500, { ok: false, error: 'delete-failed' })
+        }
+      },
+    })
+
+    // POST /dsh-session-manager/move — re-group a session under another workspace.
+    //
+    // The GUI groups sessions by the canonical `cwd` stamped in the session
+    // header, so a move rebuilds the log under a fresh id and the target cwd
+    // through the official persistence channel (create + append; the platform
+    // does the zstd encoding), then archives the original row (immediately
+    // hidden everywhere) and moves its artifact into the trash as an undoable
+    // backup. Rollback is best-effort: once the new session exists the old
+    // artifact stays in the trash either way.
+    ctx.webServer.register({
+      kind: 'exact',
+      path: `${ROUTE_PREFIX}/move`,
+      handler: async (req, res) => {
+        if (req.method !== 'POST') return respond(res, 405, { ok: false, error: 'method-not-allowed' })
+        let body: unknown
+        try {
+          body = await readJsonBody(req)
+        } catch {
+          return respond(res, 400, { ok: false, error: 'bad-request' })
+        }
+        const id = parseSessionId(body)
+        if (id === undefined) return respond(res, 400, { ok: false, error: 'invalid-session-id' })
+        const rawTarget = (body as { targetCwd?: unknown } | null)?.targetCwd
+        if (typeof rawTarget !== 'string' || rawTarget.trim().length === 0) {
+          return respond(res, 400, { ok: false, error: 'invalid-target-cwd' })
+        }
+
+        try {
+          await withMutationLock(async () => {
+            // The target must exist and must be a directory.
+            let realTarget: string
+            try {
+              realTarget = await realpath(rawTarget)
+              if (!existsSync(realTarget)) throw new Error('not a directory')
+            } catch {
+              respond(res, 400, { ok: false, error: 'invalid-target-cwd' })
+              return
+            }
+
+            const headers = await ctx.sessionPersistence.list()
+            const meta = headers.find((header) => header.id === id)
+            if (meta === undefined) {
+              respond(res, 404, { ok: false, error: 'not-found' })
+              return
+            }
+            if (ctx.agents.get(id)?.status === 'running') {
+              respond(res, 409, { ok: false, error: 'session-live' })
+              return
+            }
+
+            // Same-workspace guard: compare canonical cwds when the recorded
+            // one still resolves; fall back to the literal strings.
+            let fromCwd = meta.cwd ?? ''
+            if (fromCwd.length > 0) {
+              try {
+                fromCwd = await realpath(fromCwd)
+              } catch {
+                // keep the recorded string when it no longer resolves
+              }
+            }
+            if (fromCwd === realTarget) {
+              respond(res, 400, { ok: false, error: 'same-workspace' })
+              return
+            }
+
+            // Read + fully parse the source log BEFORE anything is written.
+            const location = meta !== undefined ? ctx.sessionPersistence.locate(meta) : undefined
+            if (location === undefined) {
+              respond(res, 500, { ok: false, error: 'no-artifact-location' })
+              return
+            }
+            let log: SessionLog
+            try {
+              log = await readSessionLog(location.path)
+            } catch (error) {
+              ctx.logger.warn(`[dsh-session-manager] move ${id}: unreadable log:`, error)
+              respond(res, 500, { ok: false, error: 'bad-artifact' })
+              return
+            }
+
+            const newId = `session-${randomUUID()}` as SessionId
+            const newMeta = { ...log.header, id: newId, cwd: realTarget }
+
+            const workspace = ctx.storageDomain.get('workspace')
+            const wasArchived = workspace !== undefined
+              && (workspace.global.get() as { archivedSessionIds: string[] }).archivedSessionIds.includes(id)
+            const originalPath = dirname(location.path)
+            const trashPath = trashSessionDir(id)
+
+            try {
+              // 1. Rebuild the log under the new id/cwd through the official
+              //    channel — the platform encodes zstd itself.
+              await ctx.sessionPersistence.create(newMeta as Parameters<typeof ctx.sessionPersistence.create>[0])
+              if (log.events.length > 0) {
+                await ctx.sessionPersistence.append(
+                  newId,
+                  log.events as unknown as Parameters<typeof ctx.sessionPersistence.append>[1],
+                )
+              }
+
+              // 2. Archive the ORIGINAL session so every client hides its row.
+              let archivedOld = false
+              try {
+                await ctx.workspaceRegistry.archiveSession(id)
+                archivedOld = true
+                const currentWorkspace = ctx.storageDomain.get('workspace')
+                if (currentWorkspace !== undefined) {
+                  const current = currentWorkspace.global.get() as { archivedSessionIds: string[] }
+                  if (!current.archivedSessionIds.includes(id)) {
+                    const next = { ...current, archivedSessionIds: [...current.archivedSessionIds, id] }
+                    await currentWorkspace.global.set(next)
+                    syncRegistryState(ctx, next)
+                  }
+                }
+              } catch (archiveError) {
+                ctx.logger.warn(`[dsh-session-manager] move ${id}: archiving original failed:`, archiveError)
+              }
+
+              // 3. Move the original artifact into the trash (undoable backup).
+              if (existsSync(originalPath)) {
+                await mkdir(trashRoot(), { recursive: true })
+                await rm(trashPath, { recursive: true, force: true })
+                await rename(originalPath, trashPath)
+              }
+
+              // 4. Record the trash entry (reuses the overflow policy).
+              const entries = getEntries()
+              const existingIndex = entries.findIndex((entry) => entry.sessionId === id)
+              let next: TrashEntry[]
+              let overflow: TrashEntry[] = []
+              if (existingIndex >= 0) {
+                next = entries.map((entry, index) => index === existingIndex ? { ...entry, deletedAt: Date.now() } : entry)
+              } else {
+                next = [...entries, { sessionId: id, cwd: meta.cwd, originalPath, deletedAt: Date.now() }]
+                if (next.length > TRASH_LIMIT) {
+                  overflow = next.slice(0, next.length - TRASH_LIMIT)
+                  next = next.slice(next.length - TRASH_LIMIT)
+                }
+              }
+              await setEntries(next)
+              for (const entry of overflow) {
+                await rm(trashSessionDir(entry.sessionId), { recursive: true, force: true }).catch(() => {})
+              }
+
+              ctx.logger.info(`[dsh-session-manager] moved ${id} -> ${newId} (${fromCwd} -> ${realTarget})`)
+              respond(res, 200, { ok: true, newSessionId: newId, fromCwd, toCwd: realTarget })
+            } catch (error) {
+              // Partial failure: the new session may already exist. Surface a
+              // distinct code so the client can tell the user to check both
+              // workspaces instead of silently retrying into a duplicate.
+              ctx.logger.warn(`[dsh-session-manager] move ${id} partially failed:`, error)
+              respond(res, 500, {
+                ok: false,
+                error: wasArchived || existsSync(trashPath) ? 'move-partial' : 'move-failed',
+                newSessionId: newId,
+              })
+            }
+          })
+        } catch (error) {
+          ctx.logger.warn('[dsh-session-manager] move failed:', error)
+          respond(res, 500, { ok: false, error: 'move-failed' })
         }
       },
     })

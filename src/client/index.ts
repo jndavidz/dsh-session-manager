@@ -32,12 +32,14 @@ import { createPortal } from 'react-dom'
 import {
   COMPACTION_THRESHOLD_ROUTE,
   DELETE_ROUTE,
+  MOVE_ROUTE,
   OPEN_FOLDER_ROUTE,
   PAUSE_ROUTE,
   PURGE_ROUTE,
   RESTORE_ROUTE,
   TRASH_ROUTE,
   type ActionResultResponse,
+  type MoveSessionResponse,
   type TrashEntry,
   type TrashListResponse,
 } from '../contract.ts'
@@ -482,6 +484,18 @@ const STYLE = `
 }
 .dsh-delete-session__more-item:hover:not(:disabled) {
   background: var(--dsw-alias-interactive-bg-hover, rgba(0, 0, 0, .06));
+}
+.dsh-delete-session__more-sep {
+  height: 1px;
+  margin: 3px 2px;
+  background: var(--dsw-alias-border-secondary, #e5e7eb);
+}
+.dsh-delete-session__more-heading {
+  padding: 4px 10px 2px;
+  color: var(--dsw-alias-label-tertiary, #6b7280);
+  font-size: 11px;
+  line-height: 1;
+  white-space: nowrap;
 }
 .dsh-delete-session__more-item:disabled {
   opacity: .5;
@@ -949,6 +963,11 @@ function stringsOf() {
         fork: '新聊天中继续',
         forkFailed: '创建子会话失败',
         forkUnavailable: '当前回合尚未结束，无法在此处切分',
+        moveSection: '迁移到工作区',
+        moveCurrent: '（当前）',
+        moved: '会话已迁移，列表已按新工作区分组',
+        moveFailed: '迁移会话失败',
+        movePartial: '迁移部分完成：新会话已创建，但原会话归档/清理未完成，请检查两侧工作区',
         more: '更多',
         batchDelete: '批量删除',
         batchDeleteConfirm: '确定删除选中的 {count} 个会话吗？它们会移入回收站，可在「回收站」中恢复或彻底删除。',
@@ -1041,6 +1060,11 @@ function stringsOf() {
         fork: 'Continue in new chat',
         forkFailed: 'Failed to fork session',
         forkUnavailable: 'the current turn is still open; it cannot be forked here',
+        moveSection: 'Move to workspace',
+        moveCurrent: '(current)',
+        moved: 'Session moved; the list is re-grouped by workspace',
+        moveFailed: 'Failed to move session',
+        movePartial: 'Move partially done: the new session exists, but archiving/cleanup of the original failed — check both workspaces',
         more: 'More',
         batchDelete: 'Delete selected',
         batchDeleteConfirm: 'Delete the {count} selected sessions? They move to the trash, where you can restore or permanently delete them.',
@@ -1098,8 +1122,8 @@ function stringsOf() {
 }
 
 function SessionManager({ useSessions, useWorkspaces, api, sessions, workspaceActions, close }: SessionManagerProps): ReactElement {
-  const list = useSessions((state) => state)
-  const workspaces = useWorkspaces((state) => state)
+  const list = useSessions((state: import('@deepseek-ai/dsh-client-runtime/client').SessionListState) => state)
+  const workspaces = useWorkspaces((state: import('@deepseek-ai/dsh-client-runtime/client').WorkspaceListState) => state)
   const [removed, setRemoved] = useState<ReadonlySet<string>>(() => loadRemoved())
   const [archivedOpen, setArchivedOpen] = useState(false)
   const [trashOpen, setTrashOpen] = useState(false)
@@ -1154,7 +1178,7 @@ function SessionManager({ useSessions, useWorkspaces, api, sessions, workspaceAc
   // Blank sessions (created, never messaged) are hidden, mirroring the
   // official sidebar — they have no content to manage and no title to show.
   const summaries: SessionSummary[] = list.ids
-    .map((id) => list.byId[id])
+    .map((id: SessionId) => list.byId[id])
     .filter((session): session is SessionSummary =>
       session !== undefined && !removed.has(session.id) && !session.blank)
   const activeRows = summaries.filter((session) => !archivedSet.has(session.id))
@@ -1169,7 +1193,7 @@ function SessionManager({ useSessions, useWorkspaces, api, sessions, workspaceAc
     const rows = sortActive(activeRows.filter((session) => view.sessionIds.includes(session.id)))
     if (rows.length > 0) activeGroups.push({ workspaceId: view.workspaceId, title: view.title || view.path, rows })
   }
-  const ungroupedActive = sortActive(activeRows.filter((session) =>
+  const ungroupedActive = sortActive(activeRows.filter((session: SessionSummary) =>
     !workspaces.items.some((view) => view.sessionIds.includes(session.id))))
   if (ungroupedActive.length > 0) activeGroups.push({ workspaceId: '__ungrouped__', title: strings.ungrouped, rows: ungroupedActive })
   groupsRef.current = activeGroups
@@ -2728,6 +2752,37 @@ function SessionDrawer({ api, sessions }: DrawerInjected): ReactElement {
     }
   }, [api, sessions, strings, showAlert])
 
+  // Move a session to another workspace: the host rebuilds the log under a
+  // fresh id stamped with the target cwd (official persistence channel) and
+  // archives the original row; the official stores then re-group both sides.
+  const handleMove = useCallback(async (sessionId: string, targetCwd: string): Promise<void> => {
+    setBusyId(sessionId)
+    try {
+      const response = await fetch(MOVE_ROUTE, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId, targetCwd }),
+      })
+      const data = (await response.json().catch(() => ({}))) as MoveSessionResponse
+      if (!response.ok || data.ok !== true) throw new Error(data.error ?? `HTTP ${response.status}`)
+      showAlert(strings.moved)
+      // Refresh the official client-side summaries so both workspaces reflect
+      // the new grouping without waiting for the next poll.
+      void (sessions as unknown as { refresh?: () => Promise<unknown> }).refresh?.()
+    } catch (error) {
+      const code = error instanceof Error ? error.message : ''
+      const friendly = code === 'move-partial'
+        ? strings.movePartial
+        : code === 'same-workspace'
+          ? strings.moveCurrent
+          : ''
+      const suffix = friendly !== '' ? ` (${friendly})` : code !== '' ? ` (${code})` : ''
+      showAlert(strings.moveFailed + suffix)
+    } finally {
+      setBusyId(null)
+    }
+  }, [sessions, strings, showAlert])
+
   const renderStatsDialog = (): ReactElement | null => {
     if (statsId === null || stats === null) return null
     const sessionTitle = rows?.find((row) => row.sessionId === statsId)?.title ?? statsId
@@ -2892,6 +2947,24 @@ function SessionDrawer({ api, sessions }: DrawerInjected): ReactElement {
               void handleFork(row.sessionId)
             },
           }, strings.fork),
+          createElement('div', { className: 'dsh-delete-session__more-sep' }),
+          createElement('div', { className: 'dsh-delete-session__more-heading' }, strings.moveSection),
+          ...(workspaces.length > 0
+            ? workspaces.map((workspace) => createElement('button', {
+              key: workspace.path,
+              type: 'button',
+              className: 'dsh-delete-session__more-item',
+              disabled: row.running || busy || row.cwd === workspace.path,
+              title: `${workspace.title} · ${workspace.path}`,
+              onClick: () => {
+                setMoreOpenId(null)
+                void handleMove(row.sessionId, workspace.path)
+              },
+            }, `${workspace.title}${row.cwd === workspace.path ? ` ${strings.moveCurrent}` : ''}`))
+            : [createElement('div', {
+              key: 'move-empty',
+              className: 'dsh-delete-session__more-heading',
+            }, strings.moveFailed)]),
           createElement('button', {
             type: 'button',
             className: 'dsh-delete-session__more-item dsh-delete-session__more-item--danger',
