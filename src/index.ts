@@ -126,15 +126,39 @@ function trashSessionDir(sessionId: string): string {
 interface SessionLog {
   header: Record<string, unknown>
   events: Record<string, unknown>[]
+  /** Lines dropped for being unparsable (truncated stream tails etc.). */
+  skippedLines: number
 }
 
 /**
- * Read and parse a session artifact (`session.jsonl` or zstd-compressed
- * `session.jsonl.zstd`). The first line must be the `session` header; every
- * remaining line must parse — a corrupt log aborts the move instead of being
- * silently truncated.
+ * Durable event types kept by a move — the same whitelist the official
+ * import pipeline uses for DSH-native logs (`dsh-chat-import`
+ * lib/convert/dsh.mjs): raw session logs interleave tens of thousands of
+ * seq-less streaming chunks plus runtime state stamps, while the write path
+ * (`append`) enforces a contiguous-seq contract over fully typed events.
+ * Everything not listed here is dropped and the survivors are renumbered
+ * from zero; `surfaceOp` survives, `sourceEventSeqs` is remapped.
  */
-async function readSessionLog(artifactPath: string): Promise<SessionLog> {
+const DURABLE_EVENT_TYPES = new Set([
+  'turn/start',
+  'step/start',
+  'user/message',
+  'assistant/message',
+  'tool/call',
+  'tool/result',
+  'step/end',
+  'turn/end',
+  'session/title',
+])
+
+/**
+ * Read and parse a session artifact (`session.jsonl` or zstd-compressed
+ * `session.jsonl.zstd`). The first line must be the `session` header; durable
+ * events are kept and renumbered. Unparsable lines (truncated stream tails,
+ * mid-log corruption) are tolerated and counted in `skippedLines` — the same
+ * contract as the official import pipeline; the caller surfaces the count.
+ */
+export async function readSessionLog(artifactPath: string): Promise<SessionLog> {
   const raw = await readFile(artifactPath)
   let text: string
   if (artifactPath.endsWith('.zstd')) {
@@ -144,24 +168,51 @@ async function readSessionLog(artifactPath: string): Promise<SessionLog> {
   }
   const lines = text.split('\n').filter((line) => line.trim().length > 0)
   if (lines.length === 0) throw new Error('empty session log')
-  let header: Record<string, unknown>
+  let parsedHeader: Record<string, unknown>
   try {
-    header = JSON.parse(lines[0]) as Record<string, unknown>
+    parsedHeader = JSON.parse(lines[0]) as Record<string, unknown>
   } catch {
     throw new Error('unparsable session header')
   }
-  if (header.type !== 'session') throw new Error('first line is not a session header')
+  if (parsedHeader.type !== 'session') throw new Error('first line is not a session header')
+
+  const oldToNew = new Map<number, number>()
   const events: Record<string, unknown>[] = []
+  let skippedLines = 0
   for (let index = 1; index < lines.length; index++) {
+    let event: Record<string, unknown>
     try {
-      events.push(JSON.parse(lines[index]) as Record<string, unknown>)
+      event = JSON.parse(lines[index]) as Record<string, unknown>
     } catch {
-      throw new Error(`unparsable event line ${index + 1}`)
+      skippedLines++
+      continue
     }
+    const type = event.type
+    const seq = event.seq
+    if (typeof type !== 'string' || !DURABLE_EVENT_TYPES.has(type)) continue
+    if (typeof seq !== 'number' || !Number.isFinite(seq)) continue
+    const data = typeof event.data === 'object' && event.data !== null ? event.data : {}
+    const next: Record<string, unknown> = {
+      type,
+      seq: events.length,
+      time: typeof event.time === 'number' && Number.isFinite(event.time) ? event.time : Date.now(),
+      data,
+    }
+    if (typeof event.surfaceOp === 'string') next.surfaceOp = event.surfaceOp
+    if (Array.isArray(event.sourceEventSeqs)) next.sourceEventSeqs = []
+    oldToNew.set(seq, next.seq as number)
+    events.push(next)
   }
-  const { type: _type, ...rest } = header
+  for (const event of events) {
+    if (!Array.isArray(event.sourceEventSeqs)) continue
+    event.sourceEventSeqs = (event.sourceEventSeqs as unknown[]).map(
+      (s) => typeof s === 'number' && oldToNew.has(s) ? oldToNew.get(s) : s,
+    )
+  }
+
+  const { type: _type, ...rest } = parsedHeader
   void _type
-  return { header: rest, events }
+  return { header: rest, events, skippedLines }
 }
 
 function readJsonBody(req: IncomingMessage): Promise<unknown> {
@@ -695,16 +746,18 @@ export function apply(ctx: Context): Promise<() => Promise<void>> {
                 await rm(trashSessionDir(entry.sessionId), { recursive: true, force: true }).catch(() => {})
               }
 
-              ctx.logger.info(`[dsh-session-manager] moved ${id} -> ${newId} (${fromCwd} -> ${realTarget})`)
+              ctx.logger.info(`[dsh-session-manager] moved ${id} -> ${newId} (${fromCwd} -> ${realTarget})${log.skippedLines > 0 ? `, ${log.skippedLines} unparsable line(s) dropped` : ''}`)
               respond(res, 200, { ok: true, newSessionId: newId, fromCwd, toCwd: realTarget })
             } catch (error) {
               // Partial failure: the new session may already exist. Surface a
-              // distinct code so the client can tell the user to check both
-              // workspaces instead of silently retrying into a duplicate.
+              // distinct code plus the underlying message so the client can
+              // tell the user what actually went wrong.
+              const detail = error instanceof Error ? error.message : String(error)
               ctx.logger.warn(`[dsh-session-manager] move ${id} partially failed:`, error)
               respond(res, 500, {
                 ok: false,
                 error: wasArchived || existsSync(trashPath) ? 'move-partial' : 'move-failed',
+                detail,
                 newSessionId: newId,
               })
             }

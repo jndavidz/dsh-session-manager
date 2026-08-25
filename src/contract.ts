@@ -69,6 +69,8 @@ export interface MoveSessionResponse {
   ok: boolean
   /** Machine-readable failure reason. */
   error?: string
+  /** Underlying failure message (diagnostics; shown by the client). */
+  detail?: string
   /** The re-created session id (the move rebuilds the log under a fresh id). */
   newSessionId?: string
   fromCwd?: string

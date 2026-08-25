@@ -39,6 +39,21 @@ declare const trashEntrySchema: z.ZodObject<{
     deletedAt: z.ZodNumber;
 }, z.core.$strip>;
 export type TrashEntry = z.infer<typeof trashEntrySchema>;
+/** One parsed session log: the header object (without its `type` tag) plus the event objects. */
+interface SessionLog {
+    header: Record<string, unknown>;
+    events: Record<string, unknown>[];
+    /** Lines dropped for being unparsable (truncated stream tails etc.). */
+    skippedLines: number;
+}
+/**
+ * Read and parse a session artifact (`session.jsonl` or zstd-compressed
+ * `session.jsonl.zstd`). The first line must be the `session` header; durable
+ * events are kept and renumbered. Unparsable lines (truncated stream tails,
+ * mid-log corruption) are tolerated and counted in `skippedLines` — the same
+ * contract as the official import pipeline; the caller surfaces the count.
+ */
+export declare function readSessionLog(artifactPath: string): Promise<SessionLog>;
 export declare function apply(ctx: Context): Promise<() => Promise<void>>;
 export {};
 //# sourceMappingURL=index.d.ts.map
