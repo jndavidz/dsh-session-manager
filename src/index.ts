@@ -42,7 +42,7 @@ import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 import { defineDomain } from '@deepseek-ai/dsh-storage-domain'
 import { z } from 'zod'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { existsSync } from 'node:fs'
+import { cpSync, existsSync } from 'node:fs'
 import { mkdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
@@ -690,23 +690,85 @@ export function apply(ctx: Context): Promise<() => Promise<void>> {
               && (workspace.global.get() as { archivedSessionIds: string[] }).archivedSessionIds.includes(id)
             const originalPath = dirname(location.path)
             const trashPath = trashSessionDir(id)
+            let archivedOriginal = false
 
             try {
-              // 1. Rebuild the log under the new id/cwd through the official
-              //    channel — the platform encodes zstd itself.
-              await ctx.sessionPersistence.create(newMeta as Parameters<typeof ctx.sessionPersistence.create>[0])
-              if (log.events.length > 0) {
-                await ctx.sessionPersistence.append(
-                  newId,
-                  log.events as unknown as Parameters<typeof ctx.sessionPersistence.append>[1],
-                )
+              // 1. Rebuild the log under the new id/cwd. Prefer the official
+              //    `agents.create` channel (same as the import pipeline): it
+              //    registers the session with the live sessions/agents
+              //    services so the GUI lists it IMMEDIATELY — bare
+              //    persistence.create only writes durable state and leaves
+              //    the row invisible until the next host restart. Fall back
+              //    to persistence when the agents service is unavailable.
+              const agentPresetsSvc = ctx.get('agentPresets') as
+                | {
+                    resolve?(): Promise<unknown>
+                    mount?(agentCtx: unknown, presetId?: string): Promise<unknown>
+                  }
+                | undefined
+              let presetId: string | undefined
+              try {
+                const resolved = await agentPresetsSvc?.resolve?.()
+                if (resolved && typeof resolved === 'object' && typeof (resolved as { id?: unknown }).id === 'string') {
+                  presetId = (resolved as { id: string }).id
+                }
+              } catch {
+                // no default preset resolvable — keep going without it
+              }
+              const seededMeta = { ...newMeta, ...(presetId !== undefined ? { agentPreset: presetId } : {}) }
+              const agentsSvc = ctx.get('agents') as
+                | {
+                    create?(options: {
+                      sessionId: SessionId
+                      meta: Record<string, unknown>
+                      seed: Record<string, unknown>[]
+                      setup?: (agentCtx: unknown) => Promise<void>
+                    }): Promise<unknown>
+                  }
+                | undefined
+              let registeredViaAgents = false
+              if (typeof agentsSvc?.create === 'function') {
+                try {
+                  await agentsSvc.create({
+                    sessionId: newId,
+                    meta: seededMeta,
+                    seed: log.events,
+                    setup: (agentCtx) => {
+                      const ap = ctx.get('agentPresets') as { mount?(a: unknown, p?: string): Promise<unknown> } | undefined
+                      return ap?.mount ? ap.mount(agentCtx, presetId).then(() => {}) : Promise.resolve()
+                    },
+                  })
+                  registeredViaAgents = true
+                } catch (agentsError) {
+                  ctx.logger.warn(`[dsh-session-manager] move ${id}: agents.create failed, falling back to persistence:`, agentsError)
+                }
+              }
+              if (!registeredViaAgents) {
+                await ctx.sessionPersistence.create(seededMeta as Parameters<typeof ctx.sessionPersistence.create>[0])
+                if (log.events.length > 0) {
+                  await ctx.sessionPersistence.append(
+                    newId,
+                    log.events as unknown as Parameters<typeof ctx.sessionPersistence.append>[1],
+                  )
+                }
+              }
+
+              // 1b. Account the new id under the target workspace so the row
+              //     shows up in the right group right away (the registry's
+              //     canonical-cwd reconcile would eventually do this too).
+              try {
+                const targetWorkspace = await ctx.workspaceRegistry.resolveByPath(realTarget)
+                if (targetWorkspace !== undefined) {
+                  await targetWorkspace.attachSession(newId)
+                }
+              } catch (attachError) {
+                ctx.logger.warn(`[dsh-session-manager] move ${id}: attaching to target workspace failed:`, attachError)
               }
 
               // 2. Archive the ORIGINAL session so every client hides its row.
-              let archivedOld = false
               try {
                 await ctx.workspaceRegistry.archiveSession(id)
-                archivedOld = true
+                archivedOriginal = true
                 const currentWorkspace = ctx.storageDomain.get('workspace')
                 if (currentWorkspace !== undefined) {
                   const current = currentWorkspace.global.get() as { archivedSessionIds: string[] }
@@ -724,7 +786,16 @@ export function apply(ctx: Context): Promise<() => Promise<void>> {
               if (existsSync(originalPath)) {
                 await mkdir(trashRoot(), { recursive: true })
                 await rm(trashPath, { recursive: true, force: true })
-                await rename(originalPath, trashPath)
+                try {
+                  await rename(originalPath, trashPath)
+                } catch (renameError) {
+                  // ~/.dsh/sessions is often a symlink onto the Drive-synced
+                  // volume while the trash lives on ext4 — a plain rename
+                  // throws EXDEV there; fall back to copy+delete.
+                  if ((renameError as NodeJS.ErrnoException).code !== 'EXDEV') throw renameError
+                  cpSync(originalPath, trashPath, { recursive: true })
+                  await rm(originalPath, { recursive: true, force: true })
+                }
               }
 
               // 4. Record the trash entry (reuses the overflow policy).
@@ -749,14 +820,29 @@ export function apply(ctx: Context): Promise<() => Promise<void>> {
               ctx.logger.info(`[dsh-session-manager] moved ${id} -> ${newId} (${fromCwd} -> ${realTarget})${log.skippedLines > 0 ? `, ${log.skippedLines} unparsable line(s) dropped` : ''}`)
               respond(res, 200, { ok: true, newSessionId: newId, fromCwd, toCwd: realTarget })
             } catch (error) {
-              // Partial failure: the new session may already exist. Surface a
-              // distinct code plus the underlying message so the client can
-              // tell the user what actually went wrong.
+              // Partial failure: the new session may already exist. Roll back
+              // the ORIGINAL session's hide-out first — a move must never leave
+              // the row invisible in both workspaces.
+              if (existsSync(trashPath) && !existsSync(originalPath)) {
+                try {
+                  await mkdir(dirname(originalPath), { recursive: true })
+                  await rename(trashPath, originalPath)
+                } catch (rollbackError) {
+                  ctx.logger.warn(`[dsh-session-manager] move ${id}: artifact rollback failed:`, rollbackError)
+                }
+              }
+              if (archivedOriginal && !wasArchived) {
+                try {
+                  await unarchive(ctx, id)
+                } catch (rollbackError) {
+                  ctx.logger.warn(`[dsh-session-manager] move ${id}: unarchive rollback failed:`, rollbackError)
+                }
+              }
               const detail = error instanceof Error ? error.message : String(error)
               ctx.logger.warn(`[dsh-session-manager] move ${id} partially failed:`, error)
               respond(res, 500, {
                 ok: false,
-                error: wasArchived || existsSync(trashPath) ? 'move-partial' : 'move-failed',
+                error: existsSync(trashPath) || (archivedOriginal && !wasArchived) ? 'move-partial' : 'move-failed',
                 detail,
                 newSessionId: newId,
               })
