@@ -43,10 +43,11 @@ import { defineDomain } from '@deepseek-ai/dsh-storage-domain'
 import { z } from 'zod'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { cpSync, existsSync } from 'node:fs'
-import { mkdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises'
+import * as zlib from 'node:zlib'
+import { mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { decompress as zstdDecompress } from 'fzstd'
 
 export const name = 'dsh-session-manager'
@@ -62,13 +63,17 @@ export const inject = [
 
 const ROUTE_PREFIX = '/dsh-session-manager'
 const MAX_BODY_BYTES = 64 * 1024
-// Official session ids come in three shapes: `session-<uuid>` (web UI,
+// Directory listings for the file-reference picker stop here; huge trees only
+// need the first slice (directories first) to be useful.
+const DIR_LIST_CAP = 500
+// Official session ids come in four shapes: `session-<uuid>` (web UI,
 // created via the api), `session-<n>` (store-minted, e.g. forks created
-// without an explicit id) and `<uuid>` (subagent children, created as
-// `SessionId(randomUUID())`). Accept all three; keep the charset tight
-// (hex + dashes only, plus the literal "session-" prefix) because the id
-// is joined into a trash path.
-const SESSION_ID_RE = /^(session-)?[0-9a-fA-F-]+$/
+// without an explicit id), `<uuid>` (subagent children, created as
+// `SessionId(randomUUID())`) and importer ids (`import-session-*`,
+// `import-sess_*` — underscores legal). Accept all of them; keep the charset
+// tight (letters, digits, dash, underscore only) and cap the length, because
+// the id is joined into a trash path.
+const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,128}$/
 /** Maximum trash entries kept; the oldest overflow is purged automatically. */
 export const TRASH_LIMIT = 10
 
@@ -149,7 +154,20 @@ const DURABLE_EVENT_TYPES = new Set([
   'step/end',
   'turn/end',
   'session/title',
+  'session/imported',
 ])
+
+/** Surface-eligible types: the replay validation requires each of these to
+ * carry a `surfaceOp` marker, and their `sourceEventSeqs` are subject to the
+ * provenance contract (empty is legal ONLY for assistant/message; the field
+ * may also be absent entirely, which skips the check). */
+const SURFACE_ELIGIBLE_TYPES = new Set(['user/message', 'assistant/message', 'tool/result'])
+
+/** Sessions live under `<root>/--<cwd with '/' → '-'>--/<sessionId>/`. */
+function sessionsDirNameFor(cwd: string): string {
+  const body = cwd.startsWith('/') ? cwd.slice(1) : cwd
+  return `--${body.replaceAll('/', '-')}--`
+}
 
 /**
  * Read and parse a session artifact (`session.jsonl` or zstd-compressed
@@ -199,15 +217,37 @@ export async function readSessionLog(artifactPath: string): Promise<SessionLog> 
       data,
     }
     if (typeof event.surfaceOp === 'string') next.surfaceOp = event.surfaceOp
-    if (Array.isArray(event.sourceEventSeqs)) next.sourceEventSeqs = []
+    if (Array.isArray(event.sourceEventSeqs)) next.sourceEventSeqs = Array.from(event.sourceEventSeqs)
     oldToNew.set(seq, next.seq as number)
     events.push(next)
   }
   for (const event of events) {
+    // Surface-eligible events must carry a surfaceOp marker after the move —
+    // importer-produced source logs can lack it, and the replay validation
+    // rejects such events ("requires a surfaceOp marker"). A continuous
+    // (non-replacement) log's correct marker is "append".
+    if (SURFACE_ELIGIBLE_TYPES.has(event.type as string) && typeof event.surfaceOp !== 'string') {
+      event.surfaceOp = 'append'
+    }
     if (!Array.isArray(event.sourceEventSeqs)) continue
-    event.sourceEventSeqs = (event.sourceEventSeqs as unknown[]).map(
-      (s) => typeof s === 'number' && oldToNew.has(s) ? oldToNew.get(s) : s,
-    )
+    // Provenance remap: keep only references that resolve to an EARLIER kept
+    // event. References to dropped (non-whitelist) events previously fell
+    // through with their OLD seq, producing forward references and
+    // out-of-range garbage (values larger than the whole new log). Empty
+    // provenance is legal for assistant/message; for user/message and
+    // tool/result the field must be dropped instead (the replay contract
+    // allows the field to be absent, which skips the check).
+    const selfSeq = event.seq as number
+    const remapped = (event.sourceEventSeqs as unknown[])
+      .map((s) => typeof s === 'number' && oldToNew.has(s) ? (oldToNew.get(s) as number) : Number.NaN)
+      .filter((s) => Number.isInteger(s) && s >= 0 && s < selfSeq)
+    if (event.type === 'assistant/message') {
+      event.sourceEventSeqs = remapped
+    } else if (remapped.length > 0) {
+      event.sourceEventSeqs = remapped
+    } else {
+      delete event.sourceEventSeqs
+    }
   }
 
   const { type: _type, ...rest } = parsedHeader
@@ -369,6 +409,24 @@ async function writePresetComposition(path: string, ratio: number): Promise<void
 }
 
 /**
+ * rename with an EXDEV fallback (copy + delete). The sessions root often
+ * lives on a Drive-synced volume while the trash lives on ext4 — a plain
+ * rename throws EXDEV across that boundary in BOTH directions: delete/move
+ * moving an artifact INTO the trash, and restore/rollback moving it back
+ * OUT. Every artifact relocation must go through this helper.
+ */
+async function movePath(from: string, to: string): Promise<void> {
+  try {
+    await rename(from, to)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EXDEV') throw error
+    await mkdir(dirname(to), { recursive: true })
+    cpSync(from, to, { recursive: true })
+    await rm(from, { recursive: true, force: true })
+  }
+}
+
+/**
  * Sync the WorkspaceRegistry's private state cache with the durable domain
  * value. There is no public unarchive API; writing the domain directly leaves
  * the registry's cached state stale, so the next archiveSession() call would
@@ -518,7 +576,10 @@ export function apply(ctx: Context): Promise<() => Promise<void>> {
                 respond(res, 500, { ok: false, error: 'no-artifact-location' })
                 return
               }
-              originalPath = dirname(location.path)
+              // realpath: persistence may hand back a DSH_HOME-symlinked
+              // path; the canonical path keeps trash bookkeeping and
+              // existsSync checks on the real volume.
+              originalPath = dirname(await realpath(location.path))
             }
 
             const workspace = ctx.storageDomain.get('workspace')
@@ -551,7 +612,7 @@ export function apply(ctx: Context): Promise<() => Promise<void>> {
               if (!live && originalPath !== undefined && existsSync(originalPath)) {
                 await mkdir(trashRoot(), { recursive: true })
                 await rm(trashPath, { recursive: true, force: true })
-                await rename(originalPath, trashPath)
+                await movePath(originalPath, trashPath)
                 artifactMoved = true
                 ctx.logger.debug(`[dsh-session-manager] moved ${id} artifact to trash`)
               }
@@ -578,8 +639,7 @@ export function apply(ctx: Context): Promise<() => Promise<void>> {
             } catch (error) {
               if (artifactMoved && originalPath !== undefined && existsSync(trashPath) && !existsSync(originalPath)) {
                 try {
-                  await mkdir(dirname(originalPath), { recursive: true })
-                  await rename(trashPath, originalPath)
+                  await movePath(trashPath, originalPath)
                 } catch (rollbackError) {
                   ctx.logger.warn(`[dsh-session-manager] artifact rollback failed for ${id}:`, rollbackError)
                 }
@@ -604,13 +664,12 @@ export function apply(ctx: Context): Promise<() => Promise<void>> {
 
     // POST /dsh-session-manager/move — re-group a session under another workspace.
     //
-    // The GUI groups sessions by the canonical `cwd` stamped in the session
-    // header, so a move rebuilds the log under a fresh id and the target cwd
-    // through the official persistence channel (create + append; the platform
-    // does the zstd encoding), then archives the original row (immediately
-    // hidden everywhere) and moves its artifact into the trash as an undoable
-    // backup. Rollback is best-effort: once the new session exists the old
-    // artifact stays in the trash either way.
+    // A move is a RELOCATION, not a rewrite: the artifact bytes are carried
+    // over untouched except for the session header's `cwd` field, so every
+    // event (streaming chunks, runtime stamps, import markers, provenance)
+    // survives byte-for-byte. The same session id is kept; the row re-groups
+    // purely through the workspace registry (detach old + attach new) — no
+    // re-encoding of events, no archive dance, no trash round-trip.
     ctx.webServer.register({
       kind: 'exact',
       path: `${ROUTE_PREFIX}/move`,
@@ -631,7 +690,6 @@ export function apply(ctx: Context): Promise<() => Promise<void>> {
 
         try {
           await withMutationLock(async () => {
-            // The target must exist and must be a directory.
             let realTarget: string
             try {
               realTarget = await realpath(rawTarget)
@@ -652,8 +710,6 @@ export function apply(ctx: Context): Promise<() => Promise<void>> {
               return
             }
 
-            // Same-workspace guard: compare canonical cwds when the recorded
-            // one still resolves; fall back to the literal strings.
             let fromCwd = meta.cwd ?? ''
             if (fromCwd.length > 0) {
               try {
@@ -667,185 +723,88 @@ export function apply(ctx: Context): Promise<() => Promise<void>> {
               return
             }
 
-            // Read + fully parse the source log BEFORE anything is written.
             const location = meta !== undefined ? ctx.sessionPersistence.locate(meta) : undefined
             if (location === undefined) {
               respond(res, 500, { ok: false, error: 'no-artifact-location' })
               return
             }
-            let log: SessionLog
-            try {
-              log = await readSessionLog(location.path)
-            } catch (error) {
-              ctx.logger.warn(`[dsh-session-manager] move ${id}: unreadable log:`, error)
-              respond(res, 500, { ok: false, error: 'bad-artifact' })
-              return
-            }
-
-            const newId = `session-${randomUUID()}` as SessionId
-            const newMeta = { ...log.header, id: newId, cwd: realTarget }
-
-            const workspace = ctx.storageDomain.get('workspace')
-            const wasArchived = workspace !== undefined
-              && (workspace.global.get() as { archivedSessionIds: string[] }).archivedSessionIds.includes(id)
-            const originalPath = dirname(location.path)
-            const trashPath = trashSessionDir(id)
-            let archivedOriginal = false
+            const sourceDir = dirname(await realpath(location.path))
+            const artifactName = basename(location.path)
+            const sessionsRoot = dirname(sourceDir)
 
             try {
-              // 1. Rebuild the log under the new id/cwd. Prefer the official
-              //    `agents.create` channel (same as the import pipeline): it
-              //    registers the session with the live sessions/agents
-              //    services so the GUI lists it IMMEDIATELY — bare
-              //    persistence.create only writes durable state and leaves
-              //    the row invisible until the next host restart. Fall back
-              //    to persistence when the agents service is unavailable.
-              const agentPresetsSvc = ctx.get('agentPresets') as
-                | {
-                    resolve?(): Promise<unknown>
-                    mount?(agentCtx: unknown, presetId?: string): Promise<unknown>
-                  }
-                | undefined
-              let presetId: string | undefined
+              // 1. Relocate the artifact directory. Copy first — the source
+              //    directory is removed only after the copy verifies, so a
+              //    failure anywhere below leaves the original untouched.
+              const targetDir = join(sessionsRoot, sessionsDirNameFor(realTarget), id as string)
+              if (existsSync(targetDir)) throw new Error('target artifact already exists')
+              await mkdir(dirname(targetDir), { recursive: true })
+              await cpSync(sourceDir, targetDir, { recursive: true })
+
+              // 2. Rewrite ONLY the header frame's cwd field. Frame 1 holds
+              //    exactly the one header line; the events frame (frame 2) is
+              //    carried over verbatim at the byte level.
+              const zstdPath = join(targetDir, artifactName)
+              const raw = await readFile(zstdPath)
+              const magic = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
+              let split = -1
+              for (let offset = 4; offset + 4 <= raw.length; offset++) {
+                if (
+                  raw[offset] === magic[0] && raw[offset + 1] === magic[1]
+                  && raw[offset + 2] === magic[2] && raw[offset + 3] === magic[3]
+                ) {
+                  split = offset
+                  break
+                }
+              }
+              if (split < 0) throw new Error('second zstd frame not found')
+              const headerFrame = raw.subarray(0, split)
+              const eventsFrame = raw.subarray(split)
+              const headerLine = new TextDecoder().decode(zstdDecompress(new Uint8Array(headerFrame))).trim()
+              const header = JSON.parse(headerLine) as Record<string, unknown>
+              header.cwd = realTarget
+              const rewrittenHeader = zlib.zstdCompressSync(
+                Buffer.from(`${JSON.stringify(header)}\n`, 'utf8'),
+                { params: { [zlib.constants.ZSTD_c_checksumFlag]: 1 } },
+              )
+              await writeFile(zstdPath, Buffer.concat([rewrittenHeader, eventsFrame]))
+
+              // 3. Verify the relocated log: the header must carry the target
+              //    cwd and the whole file must still decompress cleanly.
+              const verifyText = new TextDecoder().decode(zstdDecompress(new Uint8Array(await readFile(zstdPath))))
+              const verifyHeader = JSON.parse(verifyText.slice(0, verifyText.indexOf('\n'))) as { cwd?: unknown }
+              if (verifyHeader.cwd !== realTarget) throw new Error('header rewrite verification failed')
+
+              // 4. Registration: detach from the source workspace, attach to
+              //    the target one. Same session id — the row simply re-groups.
               try {
-                const resolved = await agentPresetsSvc?.resolve?.()
-                if (resolved && typeof resolved === 'object' && typeof (resolved as { id?: unknown }).id === 'string') {
-                  presetId = (resolved as { id: string }).id
-                }
-              } catch {
-                // no default preset resolvable — keep going without it
+                const sourceWorkspace = await ctx.workspaceRegistry.resolveByPath(fromCwd)
+                await sourceWorkspace?.detachSession(id)
+              } catch (detachError) {
+                ctx.logger.warn(`[dsh-session-manager] move ${id}: detaching from source workspace failed:`, detachError)
               }
-              const seededMeta = { ...newMeta, ...(presetId !== undefined ? { agentPreset: presetId } : {}) }
-              const agentsSvc = ctx.get('agents') as
-                | {
-                    create?(options: {
-                      sessionId: SessionId
-                      meta: Record<string, unknown>
-                      seed: Record<string, unknown>[]
-                      setup?: (agentCtx: unknown) => Promise<void>
-                    }): Promise<unknown>
-                  }
-                | undefined
-              let registeredViaAgents = false
-              if (typeof agentsSvc?.create === 'function') {
-                try {
-                  await agentsSvc.create({
-                    sessionId: newId,
-                    meta: seededMeta,
-                    seed: log.events,
-                    setup: (agentCtx) => {
-                      const ap = ctx.get('agentPresets') as { mount?(a: unknown, p?: string): Promise<unknown> } | undefined
-                      return ap?.mount ? ap.mount(agentCtx, presetId).then(() => {}) : Promise.resolve()
-                    },
-                  })
-                  registeredViaAgents = true
-                } catch (agentsError) {
-                  ctx.logger.warn(`[dsh-session-manager] move ${id}: agents.create failed, falling back to persistence:`, agentsError)
-                }
-              }
-              if (!registeredViaAgents) {
-                await ctx.sessionPersistence.create(seededMeta as Parameters<typeof ctx.sessionPersistence.create>[0])
-                if (log.events.length > 0) {
-                  await ctx.sessionPersistence.append(
-                    newId,
-                    log.events as unknown as Parameters<typeof ctx.sessionPersistence.append>[1],
-                  )
-                }
-              }
-
-              // 1b. Account the new id under the target workspace so the row
-              //     shows up in the right group right away (the registry's
-              //     canonical-cwd reconcile would eventually do this too).
               try {
                 const targetWorkspace = await ctx.workspaceRegistry.resolveByPath(realTarget)
-                if (targetWorkspace !== undefined) {
-                  await targetWorkspace.attachSession(newId)
-                }
+                await targetWorkspace?.attachSession(id)
               } catch (attachError) {
                 ctx.logger.warn(`[dsh-session-manager] move ${id}: attaching to target workspace failed:`, attachError)
               }
 
-              // 2. Archive the ORIGINAL session so every client hides its row.
-              try {
-                await ctx.workspaceRegistry.archiveSession(id)
-                archivedOriginal = true
-                const currentWorkspace = ctx.storageDomain.get('workspace')
-                if (currentWorkspace !== undefined) {
-                  const current = currentWorkspace.global.get() as { archivedSessionIds: string[] }
-                  if (!current.archivedSessionIds.includes(id)) {
-                    const next = { ...current, archivedSessionIds: [...current.archivedSessionIds, id] }
-                    await currentWorkspace.global.set(next)
-                    syncRegistryState(ctx, next)
-                  }
-                }
-              } catch (archiveError) {
-                ctx.logger.warn(`[dsh-session-manager] move ${id}: archiving original failed:`, archiveError)
-              }
+              // 5. Drop the source artifact (copy verified in step 3).
+              await rm(sourceDir, { recursive: true, force: true })
 
-              // 3. Move the original artifact into the trash (undoable backup).
-              if (existsSync(originalPath)) {
-                await mkdir(trashRoot(), { recursive: true })
-                await rm(trashPath, { recursive: true, force: true })
-                try {
-                  await rename(originalPath, trashPath)
-                } catch (renameError) {
-                  // ~/.dsh/sessions is often a symlink onto the Drive-synced
-                  // volume while the trash lives on ext4 — a plain rename
-                  // throws EXDEV there; fall back to copy+delete.
-                  if ((renameError as NodeJS.ErrnoException).code !== 'EXDEV') throw renameError
-                  cpSync(originalPath, trashPath, { recursive: true })
-                  await rm(originalPath, { recursive: true, force: true })
-                }
-              }
-
-              // 4. Record the trash entry (reuses the overflow policy).
-              const entries = getEntries()
-              const existingIndex = entries.findIndex((entry) => entry.sessionId === id)
-              let next: TrashEntry[]
-              let overflow: TrashEntry[] = []
-              if (existingIndex >= 0) {
-                next = entries.map((entry, index) => index === existingIndex ? { ...entry, deletedAt: Date.now() } : entry)
-              } else {
-                next = [...entries, { sessionId: id, cwd: meta.cwd, originalPath, deletedAt: Date.now() }]
-                if (next.length > TRASH_LIMIT) {
-                  overflow = next.slice(0, next.length - TRASH_LIMIT)
-                  next = next.slice(next.length - TRASH_LIMIT)
-                }
-              }
-              await setEntries(next)
-              for (const entry of overflow) {
-                await rm(trashSessionDir(entry.sessionId), { recursive: true, force: true }).catch(() => {})
-              }
-
-              ctx.logger.info(`[dsh-session-manager] moved ${id} -> ${newId} (${fromCwd} -> ${realTarget})${log.skippedLines > 0 ? `, ${log.skippedLines} unparsable line(s) dropped` : ''}`)
-              respond(res, 200, { ok: true, newSessionId: newId, fromCwd, toCwd: realTarget })
+              ctx.logger.info(`[dsh-session-manager] moved ${id} (${fromCwd} -> ${realTarget}, byte-preserving relocation)`)
+              respond(res, 200, { ok: true, newSessionId: id, fromCwd, toCwd: realTarget })
             } catch (error) {
-              // Partial failure: the new session may already exist. Roll back
-              // the ORIGINAL session's hide-out first — a move must never leave
-              // the row invisible in both workspaces.
-              if (existsSync(trashPath) && !existsSync(originalPath)) {
-                try {
-                  await mkdir(dirname(originalPath), { recursive: true })
-                  await rename(trashPath, originalPath)
-                } catch (rollbackError) {
-                  ctx.logger.warn(`[dsh-session-manager] move ${id}: artifact rollback failed:`, rollbackError)
-                }
-              }
-              if (archivedOriginal && !wasArchived) {
-                try {
-                  await unarchive(ctx, id)
-                } catch (rollbackError) {
-                  ctx.logger.warn(`[dsh-session-manager] move ${id}: unarchive rollback failed:`, rollbackError)
-                }
-              }
+              // The source directory is removed only at the very end, so a
+              // failure above leaves the original untouched; clean up any
+              // half-written target.
+              try {
+                await rm(join(sessionsRoot, sessionsDirNameFor(realTarget), id as string), { recursive: true, force: true })
+              } catch { /* best-effort cleanup */ }
               const detail = error instanceof Error ? error.message : String(error)
-              ctx.logger.warn(`[dsh-session-manager] move ${id} partially failed:`, error)
-              respond(res, 500, {
-                ok: false,
-                error: existsSync(trashPath) || (archivedOriginal && !wasArchived) ? 'move-partial' : 'move-failed',
-                detail,
-                newSessionId: newId,
-              })
+              ctx.logger.warn(`[dsh-session-manager] move ${id} failed:`, error)
+              respond(res, 500, { ok: false, error: 'move-failed', detail })
             }
           })
         } catch (error) {
@@ -904,7 +863,7 @@ export function apply(ctx: Context): Promise<() => Promise<void>> {
                 ctx.logger.warn(`[dsh-session-manager] restore ${id}: original path already exists, discarding trash copy`)
               } else {
                 await mkdir(dirname(entry.originalPath), { recursive: true })
-                await rename(from, entry.originalPath)
+                await movePath(from, entry.originalPath)
                 ctx.logger.debug(`[dsh-session-manager] restored ${id} artifact from trash`)
               }
             } else {
@@ -959,6 +918,56 @@ export function apply(ctx: Context): Promise<() => Promise<void>> {
         } catch (error) {
           ctx.logger.warn('[dsh-session-manager] purge failed:', error)
           respond(res, 500, { ok: false, error: 'purge-failed' })
+        }
+      },
+    })
+
+    // POST /dsh-session-manager/list-dir — list one host directory so the
+    // panel can hand out @path file references. Read-only: names, kinds, and
+    // light stats; file contents are never read here.
+    ctx.webServer.register({
+      kind: 'exact',
+      path: `${ROUTE_PREFIX}/list-dir`,
+      handler: async (req, res) => {
+        if (req.method !== 'POST') return respond(res, 405, { ok: false, error: 'method-not-allowed' })
+        let body: unknown
+        try {
+          body = await readJsonBody(req)
+        } catch {
+          return respond(res, 400, { ok: false, error: 'bad-request' })
+        }
+        const rawPath = (body as { path?: unknown } | null)?.path
+        if (typeof rawPath !== 'string' || rawPath.trim().length === 0) {
+          return respond(res, 400, { ok: false, error: 'invalid-path' })
+        }
+        try {
+          const dir = await realpath(rawPath)
+          const info = await stat(dir)
+          if (!info.isDirectory()) return respond(res, 400, { ok: false, error: 'not-a-directory' })
+          const dirents = await readdir(dir, { withFileTypes: true })
+          const byName = (a: { name: string }, b: { name: string }) => a.name.localeCompare(b.name)
+          const dirs: { name: string; type: 'directory' }[] = []
+          const files: { name: string; type: 'file' }[] = []
+          for (const dirent of dirents) {
+            if (dirent.isDirectory()) dirs.push({ name: dirent.name, type: 'directory' })
+            else files.push({ name: dirent.name, type: 'file' })
+          }
+          dirs.sort(byName)
+          files.sort(byName)
+          const capped = [...dirs, ...files].slice(0, DIR_LIST_CAP) as { name: string; type: 'directory' | 'file'; size?: number; mtime?: number }[]
+          await Promise.all(capped.map(async (entry) => {
+            try {
+              const entryStat = await stat(join(dir, entry.name))
+              entry.mtime = entryStat.mtimeMs
+              if (entry.type === 'file') entry.size = entryStat.size
+            } catch {
+              // Unreadable entry (permission, broken symlink): list it bare.
+            }
+          }))
+          respond(res, 200, { ok: true, path: dir, entries: capped })
+        } catch (error) {
+          ctx.logger.warn('[dsh-session-manager] list-dir failed:', error)
+          respond(res, 500, { ok: false, error: 'list-dir-failed' })
         }
       },
     })

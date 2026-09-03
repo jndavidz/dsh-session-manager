@@ -19,6 +19,8 @@ export declare const PAUSE_ROUTE = "/dsh-session-manager/pause";
 export declare const COMPACTION_THRESHOLD_ROUTE = "/dsh-session-manager/compaction-threshold";
 /** Move one session to a different workspace directory (re-groups it in the UI). */
 export declare const MOVE_ROUTE = "/dsh-session-manager/move";
+/** Browse one host directory so the panel can hand out `@path` references. */
+export declare const LIST_DIR_ROUTE = "/dsh-session-manager/list-dir";
 /** POST /dsh-session-manager/delete request body. */
 export interface DeleteSessionRequest {
     sessionId: string;
@@ -50,6 +52,29 @@ export interface TrashListResponse {
     /** Maximum entries kept; the oldest overflow is purged automatically. */
     limit: number;
 }
+/** POST /dsh-session-manager/list-dir request body. */
+export interface DirListRequest {
+    /** Absolute host directory to list (usually a workspace path). */
+    path: string;
+}
+/** One entry of a listed directory. */
+export interface DirEntry {
+    name: string;
+    type: 'directory' | 'file';
+    /** Byte size; files only. */
+    size?: number;
+    /** Epoch ms of the last modification, when stat succeeded. */
+    mtime?: number;
+}
+/** POST /dsh-session-manager/list-dir response body. */
+export interface DirListResponse {
+    ok: boolean;
+    /** The canonical directory actually listed. */
+    path?: string;
+    /** Directories first, then files, each group name-sorted. */
+    entries?: DirEntry[];
+    error?: string;
+}
 /** POST /dsh-session-manager/move request body. */
 export interface MoveSessionRequest {
     sessionId: string;
@@ -63,6 +88,12 @@ export interface MoveSessionResponse {
     error?: string;
     /** Underlying failure message (diagnostics; shown by the client). */
     detail?: string;
+    /**
+     * Set when `ok` is true but a post-move cleanup step failed (e.g. the
+     * original artifact could not be moved into the trash). The move itself
+     * landed; the client may surface this as a soft notice.
+     */
+    warning?: string;
     /** The re-created session id (the move rebuilds the log under a fresh id). */
     newSessionId?: string;
     fromCwd?: string;

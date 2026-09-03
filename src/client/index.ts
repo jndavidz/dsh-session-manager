@@ -27,11 +27,12 @@ import type {} from '@deepseek-ai/dsh-api-remotes/client'
 import type { ConnectionHandle, HistoryEntry, SessionId as WireSessionId } from '@deepseek-ai/dsh-api-remotes/client'
 import type { WorkspaceView } from '@deepseek-ai/dsh-api-remotes/client'
 import { Button, IconTrashOutline16, StateDot } from '@deepseek-ai/dsh-client-ui-primitives'
-import { createElement, Fragment, useCallback, useEffect, useRef, useState, useSyncExternalStore, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactElement } from 'react'
+import { createElement, Fragment, useCallback, useEffect, useRef, useState, useSyncExternalStore, type ChangeEvent as ReactChangeEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactElement } from 'react'
 import { createPortal } from 'react-dom'
 import {
   COMPACTION_THRESHOLD_ROUTE,
   DELETE_ROUTE,
+  LIST_DIR_ROUTE,
   MOVE_ROUTE,
   OPEN_FOLDER_ROUTE,
   PAUSE_ROUTE,
@@ -39,6 +40,7 @@ import {
   RESTORE_ROUTE,
   TRASH_ROUTE,
   type ActionResultResponse,
+  type DirListResponse,
   type MoveSessionResponse,
   type TrashEntry,
   type TrashListResponse,
@@ -255,6 +257,110 @@ const STYLE = `
   border-top: 1px solid var(--dsw-alias-line-border, rgba(127, 127, 127, .14));
   margin-top: 10px;
   padding-top: 8px;
+}
+/* --- session id badge + @mention / file-reference additions --- */
+.dsh-sm__sid {
+  background: var(--dsw-alias-fill-tertiary, rgba(127, 127, 127, 0.14));
+  border-radius: 6px;
+  color: var(--dsw-alias-label-secondary, #6b7280);
+  cursor: copy;
+  flex: none;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1;
+  margin-left: 6px;
+  padding: 3px 5px;
+  user-select: none;
+  white-space: nowrap;
+}
+.dsh-sm__sid:hover {
+  color: var(--dsw-alias-label-primary, #111827);
+}
+.dsh-sm__sid--copied {
+  color: #16a34a !important;
+}
+.dsh-sm__files-bar {
+  display: flex;
+  gap: 8px;
+  padding: 6px 2px;
+}
+.dsh-sm__files-ws {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  font-size: 12px;
+}
+.dsh-sm__files-up {
+  background: transparent;
+  border: 1px solid var(--dsw-alias-border-secondary, rgba(127, 127, 127, 0.3));
+  border-radius: 6px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  padding: 2px 8px;
+}
+.dsh-sm__files-path {
+  color: var(--dsw-alias-label-secondary, #6b7280);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+  padding: 2px 4px;
+}
+.dsh-sm__files-list {
+  max-height: 320px;
+  overflow-y: auto;
+}
+.dsh-sm__file-row {
+  align-items: center;
+  border-radius: 6px;
+  display: flex;
+  gap: 6px;
+  padding: 2px 6px;
+}
+.dsh-sm__file-row:hover {
+  background: var(--dsw-alias-fill-secondary, rgba(127, 127, 127, 0.1));
+}
+.dsh-sm__file-icon {
+  flex: none;
+  font-size: 12px;
+}
+.dsh-sm__file-name {
+  cursor: default;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dsh-sm__file-name--dir {
+  color: var(--dsw-alias-label-primary, #111827);
+  cursor: pointer;
+  font-weight: 500;
+}
+.dsh-sm__file-name--dir:hover {
+  text-decoration: underline;
+}
+.dsh-sm__file-size {
+  color: var(--dsw-alias-label-tertiary, #9ca3af);
+  flex: none;
+  font-size: 11px;
+}
+.dsh-sm__file-at {
+  background: transparent;
+  border: 1px solid var(--dsw-alias-border-secondary, rgba(127, 127, 127, 0.3));
+  border-radius: 6px;
+  color: var(--dsw-alias-label-secondary, #6b7280);
+  cursor: copy;
+  flex: none;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1;
+  padding: 3px 7px;
+}
+.dsh-sm__file-at:hover,
+.dsh-sm__file-at--copied {
+  border-color: #16a34a;
+  color: #16a34a;
 }
 .dsh-delete-session__group-toggle {
   align-items: center;
@@ -476,6 +582,10 @@ const STYLE = `
   border-radius: 6px;
   background: transparent;
   color: var(--dsw-alias-label-primary, #0f1115);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: 12px;
   line-height: 1;
   text-align: left;
@@ -550,13 +660,17 @@ const STYLE = `
   display: flex;
   align-items: center;
   gap: 10px;
+  /* Narrow surfaces (drawer, split view): action buttons are flex:none and
+     would otherwise crush the title down to a zero-width ellipsis — the row
+     wraps instead, so the title line always keeps readable width. */
+  flex-wrap: wrap;
   border: 1px solid var(--dsw-alias-line-border, rgba(127, 127, 127, .18));
   border-radius: 10px;
   padding: 8px 10px;
 }
 .dsh-delete-session__row-main {
   flex: 1 1 auto;
-  min-width: 0;
+  min-width: 150px;
 }
 .dsh-delete-session__row-title {
   display: flex;
@@ -923,6 +1037,76 @@ function isZh(): boolean {
   return appLocale === 'zh'
 }
 
+/** `session-<uuid>` → the uuid's first block (`051e1b3f`); other shapes pass
+ * through with the same 8-char cut so every badge has a stable width. */
+function shortSessionId(sessionId: string): string {
+  const body = sessionId.startsWith('session-') ? sessionId.slice('session-'.length) : sessionId
+  return body.slice(0, 8)
+}
+
+/**
+ * Build the official cross-session mention for one session:
+ * `@[label](dsh-session:<base64url(JSON.stringify(sessionId))>)`. Pasting the
+ * result into any composer references that exact conversation; on submit the
+ * host snapshots the source session into the new turn (max 3 per message).
+ */
+function sessionMention(sessionId: string, label: string): string {
+  const payload = window.btoa(JSON.stringify(sessionId)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+  const safe = label.replace(/[[\]()]/g, ' ').replace(/\s+/g, ' ').trim() || shortSessionId(sessionId)
+  return `@[${safe}](dsh-session:${payload})`
+}
+
+/** Clipboard write with a legacy fallback; resolves to true when it landed.
+ * The async clipboard API can hang for seconds while the document is not
+ * focused (permission prompt), so race it against a short timeout and fall
+ * back to execCommand immediately — the button feedback must feel instant. */
+function copyText(text: string): Promise<boolean> {
+  const legacy = (): boolean => {
+    try {
+      const area = document.createElement('textarea')
+      area.value = text
+      area.style.position = 'fixed'
+      area.style.opacity = '0'
+      document.body.appendChild(area)
+      area.select()
+      const done = document.execCommand('copy')
+      area.remove()
+      return done
+    } catch {
+      return false
+    }
+  }
+  const modern = window.navigator.clipboard?.writeText(text).then(
+    () => true,
+    () => legacy(),
+  )
+  if (modern === undefined) return Promise.resolve(legacy())
+  return Promise.race([
+    modern,
+    new Promise<boolean>((resolve) => window.setTimeout(() => resolve(legacy()), 600)),
+  ])
+}
+
+/** Join one directory listing name onto its canonical parent directory. */
+function joinDir(base: string, name: string): string {
+  return base.endsWith('/') ? `${base}${name}` : `${base}/${name}`
+}
+
+/** Strip the last path segment (`/a/b` → `/a`, `/a` → `/`). */
+function parentOf(dir: string): string {
+  const trimmed = dir.replace(/\/+$/, '')
+  const cut = trimmed.lastIndexOf('/')
+  if (cut <= 0) return '/'
+  return trimmed.slice(0, cut)
+}
+
+/** Compact byte size for the listing rows. */
+function formatBytes(size: number): string {
+  if (size < 1024) return `${size} B`
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`
+  return `${(size / 1024 / 1024).toFixed(1)} MB`
+}
+
 function stringsOf() {
   return isZh()
     ? {
@@ -942,6 +1126,16 @@ function stringsOf() {
         archivedHint: '已归档会话删除后移入回收站；这里只是归档状态（侧边栏隐藏）。',
         trashGroup: '回收站',
         trashHint: '保留最近 {limit} 条已删除会话，超出后最早的一条会被自动彻底删除。',
+        copyId: '复制会话 ID',
+        copiedId: '已复制会话 ID',
+        copyMention: '复制 @提及',
+        copiedMention: '已复制 @提及，粘贴到任意对话即可引用该会话',
+        copyFailed: '复制失败',
+        filesGroup: '工作区文件（@ 引用）',
+        filesHint: '点击目录进入；「@」按钮复制 @路径，粘贴到输入框即作为文件/目录引用发送。',
+        filesLoadFailed: '目录加载失败',
+        filesEmpty: '（空目录）',
+        parentDir: '.. 上级目录',
         trashEmpty: '回收站为空。',
         trashLoadFailed: '回收站加载失败',
         restore: '恢复',
@@ -1039,6 +1233,16 @@ function stringsOf() {
         archivedHint: 'Deleting an archived session moves it to the trash; this list is just the archived (sidebar-hidden) state.',
         trashGroup: 'Trash',
         trashHint: 'Keeps the most recent {limit} deleted sessions; the oldest one is purged automatically when the limit is exceeded.',
+        copyId: 'Copy session id',
+        copiedId: 'Session id copied',
+        copyMention: 'Copy @mention',
+        copiedMention: '@mention copied — paste it into any composer to reference this session',
+        copyFailed: 'Copy failed',
+        filesGroup: 'Workspace files (@ references)',
+        filesHint: 'Click a directory to enter; the "@" button copies @path — paste it into the composer to send it as a file reference.',
+        filesLoadFailed: 'Failed to list directory',
+        filesEmpty: '(empty directory)',
+        parentDir: '.. parent directory',
         trashEmpty: 'The trash is empty.',
         trashLoadFailed: 'Failed to load the trash',
         restore: 'Restore',
@@ -1137,6 +1341,11 @@ function SessionManager({ useSessions, useWorkspaces, api, sessions, workspaceAc
   const [selectedIds, setSelectedIds] = useState<ReadonlySet<string>>(new Set())
   const unread = useUnread()
   const [newestFirst, setNewestFirst] = useState(true)
+  // Per-row transient "copied" feedback for the @mention button.
+  const [copiedMid, setCopiedMid] = useState<string | null>(null)
+  // Workspace groups start COLLAPSED (row titles stay readable now that the
+  // row wraps with a min-width); the chevron on each group label expands one.
+  const [expandedGroups, setExpandedGroups] = useState<ReadonlySet<string>>(new Set())
   const [dragWorkspaceId, setDragWorkspaceId] = useState<string | null>(null)
   // Drop slot: 'before:<id>' inserts before that workspace, 'end' appends.
   const [dropSlot, setDropSlot] = useState<string | null>(null)
@@ -1266,6 +1475,7 @@ function SessionManager({ useSessions, useWorkspaces, api, sessions, workspaceAc
   const renderWorkspaceLabel = (
     group: { workspaceId: string; title: string; rows: SessionSummary[] },
     index: number,
+    expanded: boolean,
   ): ReactElement => {
     const draggable = group.workspaceId !== '__ungrouped__'
     const workspaceSelectable = group.rows.filter((session) => !session.running && session.id !== list.current)
@@ -1360,6 +1570,23 @@ function SessionManager({ useSessions, useWorkspaces, api, sessions, workspaceAc
           },
         }),
         createElement('span', { className: 'dsh-delete-session__group-label-text' }, `${group.title} (${group.rows.length})`),
+        createElement('button', {
+          type: 'button',
+          className: 'dsh-delete-session__group-toggle-chevron',
+          title: expanded ? strings.collapse : strings.expand,
+          'aria-expanded': expanded || undefined,
+          onPointerDown: (e: PointerEvent) => e.stopPropagation(),
+          onClick: (e: MouseEvent) => {
+            e.stopPropagation()
+            setExpandedGroups((current) => {
+              const next = new Set(current)
+              if (next.has(group.workspaceId)) next.delete(group.workspaceId)
+              else next.add(group.workspaceId)
+              return next
+            })
+          },
+          children: expanded ? strings.collapse : strings.expand,
+        }),
         draggable ? createElement('span', { className: 'dsh-delete-session__group-actions' },
           createElement(Button, {
             className: 'dsh-delete-session__group-action',
@@ -1400,8 +1627,10 @@ function SessionManager({ useSessions, useWorkspaces, api, sessions, workspaceAc
   }
 
   // The group block is pure presentation; the thin line hugs the group edge.
+  // Groups start expanded; the label chevron folds one manually.
   const renderWorkspaceGroup = (group: { workspaceId: string; title: string; rows: SessionSummary[] }, index: number): ReactElement => {
     const next = index + 1 < activeGroups.length ? activeGroups[index + 1] : null
+    const expanded = expandedGroups.has(group.workspaceId)
     return createElement('div', {
       key: group.workspaceId,
       className: 'dsh-delete-session__group',
@@ -1409,8 +1638,8 @@ function SessionManager({ useSessions, useWorkspaces, api, sessions, workspaceAc
       'data-line-top': dropSlot === `before:${group.workspaceId}` || undefined,
       'data-line-end': dropSlot === '__end__' && next === null || undefined,
     },
-      renderWorkspaceLabel(group, index),
-      createElement('ul', { className: 'dsh-delete-session__list' },
+      renderWorkspaceLabel(group, index, expanded),
+      expanded && createElement('ul', { className: 'dsh-delete-session__list' },
         ...group.rows.map((session) => renderRow(session, false)),
       ),
     )
@@ -1792,8 +2021,21 @@ function SessionManager({ useSessions, useWorkspaces, api, sessions, workspaceAc
         onChange: () => toggleSelected(session.id),
       }),
       createElement('div', { className: 'dsh-delete-session__row-main' },
-        createElement('div', { className: 'dsh-delete-session__row-title', title: session.displayTitle },
-          createElement('span', { className: 'dsh-delete-session__row-title-text' }, session.displayTitle),
+        createElement('div', { className: 'dsh-delete-session__row-title', title: session.displayTitle || session.id },
+          createElement('span', { className: 'dsh-delete-session__row-title-text' }, session.displayTitle || session.id),
+          createElement('span', {
+            className: 'dsh-sm__sid',
+            title: `${session.id}\n${strings.copyId}`,
+            onClick: (event: ReactMouseEvent<HTMLSpanElement>) => {
+              const el = event.currentTarget
+              event.stopPropagation()
+              void copyText(session.id).then((ok) => {
+                if (!ok) return
+                el.classList.add('dsh-sm__sid--copied')
+                window.setTimeout(() => el.classList.remove('dsh-sm__sid--copied'), 1200)
+              })
+            },
+          }, shortSessionId(session.id)),
           (() => {
             const dotStatus = rowStatusDot(session, unread.has(session.id))
             return renderStatusDot(
@@ -1862,6 +2104,21 @@ function SessionManager({ useSessions, useWorkspaces, api, sessions, workspaceAc
         disabled: busy,
         onClick: () => void handleRestore(session.id, session.displayTitle),
         children: strings.restore,
+      }),
+      createElement(Button, {
+        className: 'dsh-row-action',
+        variant: 'outline',
+        size: 'sm',
+        disabled: busy,
+        title: copiedMid === session.id ? strings.copiedMention : `${strings.copyMention}（@）`,
+        onClick: () => {
+          void copyText(sessionMention(session.id, session.displayTitle || session.id)).then((ok) => {
+            if (!ok) return
+            setCopiedMid(session.id)
+            window.setTimeout(() => setCopiedMid((current) => current === session.id ? null : current), 1500)
+          })
+        },
+        children: copiedMid === session.id ? '✓' : '@',
       }),
       createElement(Button, {
         className: 'dsh-row-action',
@@ -2014,6 +2271,7 @@ function SessionManager({ useSessions, useWorkspaces, api, sessions, workspaceAc
         strings.trashHint.replace('{limit}', String(trashLimit)),
       ),
     ),
+    createElement(FileBrowserSection, { workspaces: workspaces.items }),
     renderStatsDialog(),
   )
 }
@@ -2466,6 +2724,151 @@ function HeaderManageButton(_props: DrawerInjected): ReactElement {
  * (`session.list` / `workspace.list`) because session-scope slots do not
  * receive the `useSessions`/`useWorkspaces` hooks.
  */
+/**
+ * Shared "Workspace files (@ references)" fold-out: pick a workspace, browse
+ * its directories, and copy `@/abs/path` tokens that the composer turns into
+ * official file references. Used by both the settings panel and the drawer.
+ */
+function FileBrowserSection({ workspaces }: { workspaces: readonly WorkspaceView[] }): ReactElement {
+  const strings = useLocaleStrings()
+  const [open, setOpen] = useState(false)
+  const [wsPath, setWsPath] = useState('')
+  const [dir, setDir] = useState('')
+  const [entries, setEntries] = useState<{ name: string; type: 'directory' | 'file'; size?: number }[]>([])
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  // Per-file transient "@" copy feedback.
+  const [copiedFile, setCopiedFile] = useState<string | null>(null)
+
+  const loadDir = useCallback(async (target: string): Promise<void> => {
+    if (target === '') return
+    setBusy(true)
+    try {
+      const response = await fetch(LIST_DIR_ROUTE, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ path: target }),
+      })
+      const data = (await response.json().catch(() => ({}))) as DirListResponse
+      if (!response.ok || data.ok !== true || data.entries === undefined) {
+        setError(data.error ?? `HTTP ${response.status}`)
+        return
+      }
+      setError(null)
+      if (typeof data.path === 'string') setDir(data.path)
+      setEntries(data.entries)
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : 'error')
+    } finally {
+      setBusy(false)
+    }
+  }, [])
+
+  const toggle = useCallback((): void => {
+    setOpen((value) => !value)
+    if (!open && dir === '') {
+      // Preferred starting directory: the repos workspace when registered,
+      // otherwise the first workspace that carries a path.
+      const preferred = workspaces.some((workspace) => workspace.path === '/mnt/d/repos')
+        ? '/mnt/d/repos'
+        : workspaces.find((workspace) => typeof workspace.path === 'string' && workspace.path !== '')?.path
+      if (typeof preferred === 'string' && preferred !== '') {
+        setWsPath(preferred)
+        setDir(preferred)
+        void loadDir(preferred)
+      }
+    }
+  }, [open, dir, workspaces, loadDir])
+
+  return createElement('div', { className: 'dsh-delete-session__group' },
+    createElement('button', {
+      type: 'button',
+      className: 'dsh-delete-session__group-toggle',
+      onClick: toggle,
+      'aria-expanded': open || undefined,
+    },
+      createElement('span', { className: 'dsh-delete-session__group-toggle-label' }, strings.filesGroup),
+      createElement('span', { className: 'dsh-delete-session__group-toggle-chevron' },
+        open ? strings.collapse : strings.expand,
+      ),
+    ),
+    open && createElement('div', { className: 'dsh-sm__files' },
+      workspaces.length > 0 && createElement('div', { className: 'dsh-sm__files-bar' },
+        createElement('select', {
+          className: 'dsh-sm__files-ws',
+          value: wsPath,
+          onChange: (event: ReactChangeEvent<HTMLSelectElement>) => {
+            const next = event.target.value
+            if (next === '') return
+            setWsPath(next)
+            setDir(next)
+            void loadDir(next)
+          },
+        },
+          workspaces.map((workspace) => createElement('option', {
+            key: workspace.path ?? workspace.title ?? '',
+            value: workspace.path ?? '',
+          }, workspace.title ?? workspace.path ?? '')),
+        ),
+        createElement('button', {
+          type: 'button',
+          className: 'dsh-sm__files-up',
+          disabled: busy || dir === '' || dir === '/',
+          title: strings.parentDir,
+          onClick: () => {
+            const up = parentOf(dir)
+            setDir(up)
+            void loadDir(up)
+          },
+          children: strings.parentDir,
+        }),
+      ),
+      createElement('div', { className: 'dsh-sm__files-path' }, dir === '' ? '—' : dir),
+      error !== null && createElement('div',
+        { className: 'dsh-delete-session__notice dsh-delete-session__notice--error' },
+        `${strings.filesLoadFailed} (${error})`),
+      error === null && !busy && entries.length === 0
+        ? createElement('div', { className: 'dsh-delete-session__empty' }, strings.filesEmpty)
+        : null,
+      createElement('div', { className: 'dsh-sm__files-list' },
+        entries.map((entry) => {
+          const full = joinDir(dir, entry.name)
+          const copied = copiedFile === full
+          return createElement('div', { key: `${entry.type}:${entry.name}`, className: 'dsh-sm__file-row' },
+            createElement('span', { className: 'dsh-sm__file-icon' }, entry.type === 'directory' ? '📁' : '📄'),
+            entry.type === 'directory'
+              ? createElement('span', {
+                  className: 'dsh-sm__file-name dsh-sm__file-name--dir',
+                  title: full,
+                  onClick: () => void loadDir(full),
+                }, entry.name)
+              : createElement('span', { className: 'dsh-sm__file-name', title: full },
+                  entry.name,
+                  typeof entry.size === 'number'
+                    ? createElement('span', { className: 'dsh-sm__file-size' }, ` ${formatBytes(entry.size)}`)
+                    : null,
+                ),
+            createElement('button', {
+              type: 'button',
+              className: 'dsh-sm__file-at' + (copied ? ' dsh-sm__file-at--copied' : ''),
+              title: copied ? strings.copiedMention : '@path',
+              onClick: () => {
+                void copyText(`@${full}`).then((ok) => {
+                  if (!ok) return
+                  setCopiedFile(full)
+                  window.setTimeout(() => setCopiedFile((current) => current === full ? null : current), 1500)
+                })
+              },
+              children: copied ? '✓' : '@',
+            }),
+          )
+        }),
+      ),
+    ),
+    createElement('div', { className: 'dsh-delete-session__group-hint' }, strings.filesHint),
+  )
+}
+
 function SessionDrawerHost({ api, sessions }: DrawerInjected): ReactElement | null {
   const state = useDrawerState()
   if (!state.open) return null
@@ -2512,7 +2915,12 @@ function SessionDrawer({ api, sessions }: DrawerInjected): ReactElement {
   const [stats, setStats] = useState<StatsState | null>(null)
   const unread = useUnread()
   const [moreOpenId, setMoreOpenId] = useState<string | null>(null)
+  // Fixed-layer anchor for the portalled "More" menu (viewport coordinates).
+  const [morePos, setMorePos] = useState<{ top: number; right: number } | null>(null)
   const [newestFirst, setNewestFirst] = useState(true)
+  // Per-row transient "copied" feedback for the id badge / @mention button.
+  const [copiedSid, setCopiedSid] = useState<string | null>(null)
+  const [copiedMid, setCopiedMid] = useState<string | null>(null)
   const [dragWorkspaceId, setDragWorkspaceId] = useState<string | null>(null)
   // Drop slot: 'before:<id>' inserts before that workspace, 'end' appends.
   const [dropSlot, setDropSlot] = useState<string | null>(null)
@@ -2539,12 +2947,13 @@ function SessionDrawer({ api, sessions }: DrawerInjected): ReactElement {
       }))
     : null
 
-  // Close the per-row "More" menu on outside pointer-down.
+  // Close the per-row "More" menu on outside pointer-down. The menu renders
+  // in a body portal (fixed), so its own class must count as "inside" too.
   useEffect(() => {
     if (moreOpenId === null) return
     const onPointerDown = (event: MouseEvent): void => {
       if (!(event.target instanceof Element)) return
-      if (event.target.closest('.dsh-delete-session__more-wrap') !== null) return
+      if (event.target.closest('.dsh-delete-session__more-wrap, .dsh-delete-session__more-menu') !== null) return
       setMoreOpenId(null)
     }
     document.addEventListener('pointerdown', onPointerDown)
@@ -2870,8 +3279,20 @@ function SessionDrawer({ api, sessions }: DrawerInjected): ReactElement {
       'data-archived': row.archived || undefined,
     },
       createElement('div', { className: 'dsh-delete-session__row-main' },
-        createElement('div', { className: 'dsh-delete-session__row-title', title: row.title },
-          createElement('span', { className: 'dsh-delete-session__row-title-text' }, row.title),
+        createElement('div', { className: 'dsh-delete-session__row-title', title: row.title || row.sessionId },
+          createElement('span', { className: 'dsh-delete-session__row-title-text' }, row.title || row.sessionId),
+          createElement('span', {
+            className: 'dsh-sm__sid' + (copiedSid === row.sessionId ? ' dsh-sm__sid--copied' : ''),
+            title: `${row.sessionId}\n${strings.copyId}`,
+            onClick: (event: ReactMouseEvent<HTMLSpanElement>) => {
+              event.stopPropagation()
+              void copyText(row.sessionId).then((ok) => {
+                if (!ok) return
+                setCopiedSid(row.sessionId)
+                window.setTimeout(() => setCopiedSid((current) => current === row.sessionId ? null : current), 1200)
+              })
+            },
+          }, shortSessionId(row.sessionId)),
           (() => {
             const dotStatus = rowStatusDot(row, unread.has(row.sessionId))
             return renderStatusDot(
@@ -2909,6 +3330,19 @@ function SessionDrawer({ api, sessions }: DrawerInjected): ReactElement {
       ),
       createElement(Button, {
         className: 'dsh-row-action',
+        variant: 'outline', size: 'sm', disabled: busy,
+        title: copiedMid === row.sessionId ? strings.copiedMention : `${strings.copyMention}（@）`,
+        onClick: () => {
+          void copyText(sessionMention(row.sessionId, row.title || row.sessionId)).then((ok) => {
+            if (!ok) return
+            setCopiedMid(row.sessionId)
+            window.setTimeout(() => setCopiedMid((current) => current === row.sessionId ? null : current), 1500)
+          })
+        },
+        children: copiedMid === row.sessionId ? '✓' : '@',
+      }),
+      createElement(Button, {
+        className: 'dsh-row-action',
         variant: 'outline', size: 'sm', disabled: row.running || busy,
         onClick: () => handleContinue(row.sessionId), children: strings.continue,
       }),
@@ -2916,10 +3350,31 @@ function SessionDrawer({ api, sessions }: DrawerInjected): ReactElement {
         createElement(Button, {
           className: 'dsh-row-action',
           variant: 'outline', size: 'sm', disabled: busy,
-          onClick: () => setMoreOpenId(moreOpenId === row.sessionId ? null : row.sessionId),
+          onClick: (event: ReactMouseEvent<HTMLButtonElement>) => {
+            // Anchor the menu to the button via a BODY-PORTALLED fixed layer:
+            // an absolute menu inside the drawer body gets clipped by its
+            // scroll container (overflow-x follows overflow-y), which pushed
+            // the long "move to workspace" items out of view.
+            const rect = event.currentTarget.getBoundingClientRect()
+            const opening = moreOpenId !== row.sessionId
+            setMorePos({ top: rect.bottom + 4, right: Math.max(8, window.innerWidth - rect.right) })
+            setMoreOpenId(opening ? row.sessionId : null)
+          },
           children: strings.more,
         }),
-        moreOpenId === row.sessionId && createElement('div', { className: 'dsh-delete-session__more-menu' },
+        moreOpenId === row.sessionId && morePos !== null && createPortal(
+          createElement('div', {
+            className: 'dsh-delete-session__more-menu',
+            style: {
+              position: 'fixed',
+              top: Math.min(morePos.top, Math.max(8, window.innerHeight - 360)),
+              right: morePos.right,
+              zIndex: 2000,
+              maxHeight: '60vh',
+              overflowY: 'auto',
+              maxWidth: 'min(280px, calc(100vw - 24px))',
+            },
+          },
           createElement('button', {
             type: 'button',
             className: 'dsh-delete-session__more-item',
@@ -2974,8 +3429,8 @@ function SessionDrawer({ api, sessions }: DrawerInjected): ReactElement {
               void handleDelete(row.sessionId, row.title)
             },
           }, strings.delete),
+          ), document.body),
         ),
-      ),
       row.archived && createElement(Button, {
         className: 'dsh-row-action',
         variant: 'outline', size: 'sm', disabled: busy,
@@ -3126,6 +3581,7 @@ function SessionDrawer({ api, sessions }: DrawerInjected): ReactElement {
   const renderWorkspaceLabel = (
     group: { workspaceId: string; title: string; rows: DrawerRow[] },
     index: number,
+    expanded: boolean,
   ): ReactElement => {
     const draggable = group.workspaceId !== '__ungrouped__'
     return createElement('div', {
@@ -3198,6 +3654,23 @@ function SessionDrawer({ api, sessions }: DrawerInjected): ReactElement {
       } : undefined,
       children: [
         createElement('span', { className: 'dsh-delete-session__group-label-text' }, `${group.title} (${group.rows.length})`),
+        createElement('button', {
+          type: 'button',
+          className: 'dsh-delete-session__group-toggle-chevron',
+          title: expanded ? strings.collapse : strings.expand,
+          'aria-expanded': expanded || undefined,
+          onPointerDown: (e: PointerEvent) => e.stopPropagation(),
+          onClick: (e: MouseEvent) => {
+            e.stopPropagation()
+            setExpandedGroups((current) => {
+              const next = new Set(current)
+              if (next.has(group.workspaceId)) next.delete(group.workspaceId)
+              else next.add(group.workspaceId)
+              return next
+            })
+          },
+          children: expanded ? strings.collapse : strings.expand,
+        }),
         draggable ? createElement('span', { className: 'dsh-delete-session__group-actions' },
           createElement(Button, {
             className: 'dsh-delete-session__group-action',
@@ -3238,8 +3711,13 @@ function SessionDrawer({ api, sessions }: DrawerInjected): ReactElement {
   }
 
   // The group block is pure presentation; the thin line hugs the group edge.
+  // Workspace groups start COLLAPSED (same as the settings panel); the
+  // chevron on each group label expands one.
+  const [expandedGroups, setExpandedGroups] = useState<ReadonlySet<string>>(new Set())
+
   const renderWorkspaceGroup = (group: { workspaceId: string; title: string; rows: DrawerRow[] }, index: number): ReactElement => {
     const next = index + 1 < activeGroups.length ? activeGroups[index + 1] : null
+    const expanded = expandedGroups.has(group.workspaceId)
     return createElement('div', {
       key: group.workspaceId,
       className: 'dsh-delete-session__group',
@@ -3247,8 +3725,8 @@ function SessionDrawer({ api, sessions }: DrawerInjected): ReactElement {
       'data-line-top': dropSlot === `before:${group.workspaceId}` || undefined,
       'data-line-end': dropSlot === '__end__' && next === null || undefined,
     },
-      renderWorkspaceLabel(group, index),
-      createElement('ul', { className: 'dsh-delete-session__list' },
+      renderWorkspaceLabel(group, index, expanded),
+      expanded && createElement('ul', { className: 'dsh-delete-session__list' },
         ...group.rows.map((row) => renderRow(row)),
       ),
     )
@@ -3345,6 +3823,7 @@ function SessionDrawer({ api, sessions }: DrawerInjected): ReactElement {
             strings.trashHint.replace('{limit}', String(trashLimit)),
           ),
         ),
+        createElement(FileBrowserSection, { workspaces }),
       ),
     ),
     renderStatsDialog(),
