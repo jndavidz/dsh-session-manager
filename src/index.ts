@@ -730,7 +730,11 @@ export function apply(ctx: Context): Promise<() => Promise<void>> {
             }
             const sourceDir = dirname(await realpath(location.path))
             const artifactName = basename(location.path)
-            const sessionsRoot = dirname(sourceDir)
+            // sourceDir = <sessionsRoot>/<workspaceDir>/<sessionId>: the
+            // sessions root is TWO levels up. One dirname would yield the
+            // source workspace dir and nest the target inside it (the
+            // 2026-09-03 "vanished session" incident).
+            const sessionsRoot = dirname(dirname(sourceDir))
 
             try {
               // 1. Relocate the artifact directory. Copy first — the source
