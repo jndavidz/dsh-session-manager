@@ -2,3 +2,7 @@ node_modules/
 dist/
 *.log
 .tmp/
+
+# 2026-09-08: env 凭证防上车
+.env
+.env.local
